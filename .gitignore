@@ -1,7 +1,10 @@
 *.pth
 *.t7
 output/*
+output*/*
 .idea
 experiments/*
 logs/*
 *.pth.tar
+**__pycache__**
+input/xiaoyu/*

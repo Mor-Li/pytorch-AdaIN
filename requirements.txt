@@ -8,3 +8,4 @@ torchvision==0.14.1   # 已修改为与 torch 对应的版本
 tqdm==4.35.0
 opencv-python
 imageio==2.9.0
+matplotlib==3.8.4
