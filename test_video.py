@@ -9,7 +9,6 @@ from PIL import Image
 import cv2
 import imageio
 from torchvision import transforms
-from torchvision.utils import save_image
 
 import net
 from function import adaptive_instance_normalization, coral
@@ -83,18 +82,20 @@ args = parser.parse_args()
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+# Debug: Print device info
+print(f"Using device: {device}")
+
 output_dir = Path(args.output)
-output_dir.mkdir(exist_ok = True, parents = True)
+output_dir.mkdir(exist_ok=True, parents=True)
 
-# --content_video should be given.
-assert (args.content_video)
-if args.content_video:
-    content_path = Path(args.content_video)
+# Check input videos and models
+assert (args.content_video), "Content video path is required!"
+assert (args.style_path), "Style path is required!"
+assert Path(args.vgg).exists(), f"VGG model not found at {args.vgg}"
+assert Path(args.decoder).exists(), f"Decoder model not found at {args.decoder}"
 
-# --style_path should be given
-assert (args.style_path)
-if args.style_path:
-    style_path = Path(args.style_path)
+content_path = Path(args.content_video)
+style_path = Path(args.style_path)
 
 decoder = net.decoder
 vgg = net.vgg
@@ -102,99 +103,122 @@ vgg = net.vgg
 decoder.eval()
 vgg.eval()
 
+# Debug: Model loading
+print("Loading VGG model...")
 decoder.load_state_dict(torch.load(args.decoder))
 vgg.load_state_dict(torch.load(args.vgg))
 vgg = nn.Sequential(*list(vgg.children())[:31])
-
 vgg.to(device)
 decoder.to(device)
 
 content_tf = test_transform(args.content_size, args.crop)
 style_tf = test_transform(args.style_size, args.crop)
-        
-#get video fps & video size
+
+# Open content video
 content_video = cv2.VideoCapture(args.content_video)
+if not content_video.isOpened():
+    raise FileNotFoundError(f"Content video not found at {args.content_video}")
+
 fps = int(content_video.get(cv2.CAP_PROP_FPS))
 content_video_length = int(content_video.get(cv2.CAP_PROP_FRAME_COUNT))
 output_width = int(content_video.get(cv2.CAP_PROP_FRAME_WIDTH))
 output_height = int(content_video.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
-assert fps != 0, 'Fps is zero, Please enter proper video path'
+# Debug: Video properties
+print(f"Content video FPS: {fps}, Frames: {content_video_length}, Width: {output_width}, Height: {output_height}")
 
-pbar = tqdm(total = content_video_length)
+assert fps != 0, 'FPS is zero, check content video path.'
+
+pbar = tqdm(total=content_video_length)
+
 if style_path.suffix in [".mp4", ".mpg", ".avi"]:
-
     style_video = cv2.VideoCapture(args.style_path)
+    if not style_video.isOpened():
+        raise FileNotFoundError(f"Style video not found at {args.style_path}")
+
     style_video_length = int(style_video.get(cv2.CAP_PROP_FRAME_COUNT))
+    assert style_video_length == content_video_length, 'Frame mismatch between content and style video.'
 
-    assert style_video_length==content_video_length, 'Content video and style video has different number of frames'
-
-    output_video_path = output_name = output_dir / '{:s}_stylized_{:s}{:s}'.format(
-                content_path.stem, style_path.stem, args.save_ext)
+    output_video_path = output_dir / f"{content_path.stem}_stylized_{style_path.stem}{args.save_ext}"
     writer = imageio.get_writer(output_video_path, mode='I', fps=fps)
-    
-    while(True):
+
+    while True:
         ret, content_img = content_video.read()
+        ret_style, style_img = style_video.read()
 
-        if not ret:
+        if not ret or not ret_style:
+            print("End of video reached.")
             break
-        _, style_img = style_video.read()
 
-        content = content_tf(Image.fromarray(content_img))
-        style = style_tf(Image.fromarray(style_img))
+        # Debug: Frame info
+        print(f"Processing frame {pbar.n + 1}/{content_video_length}")
 
-        if args.preserve_color:
-            style = coral(style, content)
+        try:
+            content = content_tf(Image.fromarray(content_img))
+            style = style_tf(Image.fromarray(style_img))
 
-        style = style.to(device).unsqueeze(0)
-        content = content.to(device).unsqueeze(0)
-        with torch.no_grad():
-            output = style_transfer(vgg, decoder, content, style,
-                                    args.alpha)
-        output = output.cpu()
-        output = output.squeeze(0)
-        output = np.array(output)*255
-        #output = np.uint8(output)
-        output = np.transpose(output, (1,2,0))
-        output = cv2.resize(output, (output_width, output_height), interpolation=cv2.INTER_CUBIC)
+            if args.preserve_color:
+                style = coral(style, content)
 
-        writer.append_data(np.array(output))
+            style = style.to(device).unsqueeze(0)
+            content = content.to(device).unsqueeze(0)
+
+            with torch.no_grad():
+                output = style_transfer(vgg, decoder, content, style, args.alpha)
+
+            output = output.cpu().squeeze(0).numpy() * 255
+            output = np.transpose(output, (1, 2, 0)).astype(np.uint8)
+            output = cv2.resize(output, (output_width, output_height), interpolation=cv2.INTER_CUBIC)
+            writer.append_data(output)
+
+        except Exception as e:
+            print(f"Error processing frame {pbar.n + 1}: {e}")
+            break
+
         pbar.update(1)
-    
+
     style_video.release()
     content_video.release()
 
-if style_path.suffix in [".jpg", ".png", ".JPG", ".PNG"]:
-
-    output_video_path = output_dir / '{:s}_stylized_{:s}{:s}'.format(
-                content_path.stem, style_path.stem, args.save_ext)
-    writer = imageio.get_writer(output_video_path, mode='I', fps=fps)
-    
+else:
     style_img = Image.open(style_path)
-    while(True):
+    output_video_path = output_dir / f"{content_path.stem}_stylized_{style_path.stem}{args.save_ext}"
+    writer = imageio.get_writer(output_video_path, mode='I', fps=fps)
+
+    while True:
         ret, content_img = content_video.read()
-
         if not ret:
+            print("End of video reached.")
             break
-        content = content_tf(Image.fromarray(content_img))
-        style = style_tf(style_img)
 
-        if args.preserve_color:
-            style = coral(style, content)
+        # Debug: Frame info
+        print(f"Processing frame {pbar.n + 1}/{content_video_length}")
 
-        style = style.to(device).unsqueeze(0)
-        content = content.to(device).unsqueeze(0)
-        with torch.no_grad():
-            output = style_transfer(vgg, decoder, content, style,
-                                    args.alpha)
-        output = output.cpu()
-        output = output.squeeze(0)
-        output = np.array(output)*255
-        #output = np.uint8(output)
-        output = np.transpose(output, (1,2,0))
-        output = cv2.resize(output, (output_width, output_height), interpolation=cv2.INTER_CUBIC)
+        try:
+            content = content_tf(Image.fromarray(content_img))
+            style = style_tf(style_img)
 
-        writer.append_data(np.array(output))
+            if args.preserve_color:
+                style = coral(style, content)
+
+            style = style.to(device).unsqueeze(0)
+            content = content.to(device).unsqueeze(0)
+
+            with torch.no_grad():
+                output = style_transfer(vgg, decoder, content, style, args.alpha)
+
+            output = output.cpu().squeeze(0).numpy() * 255
+            output = np.transpose(output, (1, 2, 0)).astype(np.uint8)
+            output = cv2.resize(output, (output_width, output_height), interpolation=cv2.INTER_CUBIC)
+            writer.append_data(output)
+
+        except Exception as e:
+            print(f"Error processing frame {pbar.n + 1}: {e}")
+            break
+
         pbar.update(1)
-    
+
     content_video.release()
+
+# Debug: Final message
+print(f"Video stylization complete. Saved to {output_video_path}")
